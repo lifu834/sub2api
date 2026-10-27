@@ -92,6 +92,11 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
+	// StickyEscapedAccountID is set by Select after a TTFT/error-rate sticky
+	// escape (NYCATAI patch sticky-escape-exclude): load balancing avoids it
+	// unless it is the only usable account, and the selection seed gets time
+	// entropy so the session does not deterministically redraw it.
+	StickyEscapedAccountID int64
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -453,7 +458,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	}
 
 	if !req.StickyWeighted {
-		selection, escapeKind, err := s.selectBySessionHashWithEscape(ctx, req)
+		selection, escapeKind, escapedAccountID, err := s.selectBySessionHashWithEscape(ctx, req)
 		if err != nil {
 			return nil, decision, err
 		}
@@ -471,9 +476,14 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		if escapeKind == openAIStickyEscapeBusy {
 			req.PreserveStickyBinding = true
 		}
+		// NYCATAI patch (sticky-escape-exclude): 健康逃逸后重选时排除原号并加时间熵,
+		// 否则同一会话的种子固定, 分值格局不变时会确定性地抽回原号再绑回去。
+		if escapeKind == openAIStickyEscapeHealth {
+			req.StickyEscapedAccountID = escapedAccountID
+		}
 	}
 
-	selection, candidateCount, topK, loadSkew, err := s.selectByLoadBalance(ctx, req)
+	selection, candidateCount, topK, loadSkew, err := s.selectByLoadBalanceAfterStickyEscape(ctx, req)
 	decision.Layer = openAIAccountScheduleLayerLoadBalance
 	decision.CandidateCount = candidateCount
 	decision.TopK = topK
@@ -496,6 +506,36 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	return selection, decision, nil
 }
 
+// NYCATAI patch (sticky-escape-exclude): 健康逃逸后负载均衡先排除原号;
+// 排除后没有可用号时再放开原号重选, 保证只剩原号时请求仍能成功。
+func (s *defaultOpenAIAccountScheduler) selectByLoadBalanceAfterStickyEscape(
+	ctx context.Context,
+	req OpenAIAccountScheduleRequest,
+) (*AccountSelectionResult, int, int, float64, error) {
+	escapedAccountID := req.StickyEscapedAccountID
+	if escapedAccountID <= 0 {
+		return s.selectByLoadBalance(ctx, req)
+	}
+	excludeReq := req
+	excludeReq.ExcludedIDs = cloneExcludedAccountIDs(req.ExcludedIDs)
+	if excludeReq.ExcludedIDs == nil {
+		excludeReq.ExcludedIDs = make(map[int64]struct{}, 1)
+	}
+	excludeReq.ExcludedIDs[escapedAccountID] = struct{}{}
+	selection, candidateCount, topK, loadSkew, err := s.selectByLoadBalance(ctx, excludeReq)
+	if err == nil && selection != nil && selection.Account != nil {
+		return selection, candidateCount, topK, loadSkew, nil
+	}
+	if err != nil && !errors.Is(err, ErrNoAvailableAccounts) && !errors.Is(err, ErrNoAvailableCompactAccounts) {
+		return nil, candidateCount, topK, loadSkew, err
+	}
+	if selection != nil && selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+	slog.Info("sticky_escape_fallback_to_escaped_account", "account_id", escapedAccountID)
+	return s.selectByLoadBalance(ctx, req)
+}
+
 // NYCATAI patch (sticky-escape-rebind): 区分逃逸原因。
 type openAIStickyEscapeKind int
 
@@ -509,17 +549,18 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, bool, error) {
-	selection, kind, err := s.selectBySessionHashWithEscape(ctx, req)
+	selection, kind, _, err := s.selectBySessionHashWithEscape(ctx, req)
 	return selection, kind != openAIStickyEscapeNone, err
 }
 
+// selectBySessionHashWithEscape 发生逃逸时额外返回被逃逸的原号 ID(未逃逸时为 0)。
 func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
-) (*AccountSelectionResult, openAIStickyEscapeKind, error) {
+) (*AccountSelectionResult, openAIStickyEscapeKind, int64, error) {
 	sessionHash := strings.TrimSpace(req.SessionHash)
 	if sessionHash == "" || s == nil || s.service == nil || s.service.cache == nil {
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 
 	accountID := req.StickyAccountID
@@ -532,55 +573,55 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 		var err error
 		accountID, err = s.service.getStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		if err != nil || accountID <= 0 {
-			return nil, openAIStickyEscapeNone, nil
+			return nil, openAIStickyEscapeNone, 0, nil
 		}
 	}
 	if accountID <= 0 {
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	if req.ExcludedIDs != nil {
 		if _, excluded := req.ExcludedIDs[accountID]; excluded {
-			return nil, openAIStickyEscapeNone, nil
+			return nil, openAIStickyEscapeNone, 0, nil
 		}
 	}
 
 	account, err := s.service.getSchedulableAccount(ctx, accountID)
 	if err != nil || account == nil {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	if !s.isAccountRequestCompatible(ctx, account, req) {
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	// Free-tier soft gate: sticky session must not pin an over-quota free OAuth account.
 	// Admin QueryQuota / import probes do not use this path.
 	if account != nil && len(s.filterGrokFreeQuotaAccounts(ctx, []Account{*account})) == 0 {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	// Team+model cool: sticky must not pin a sibling under the same team 429 window.
 	now := time.Now()
 	upstreamModel := canonicalOpenAIAccountSchedulingModel(account, req.RequestedModel)
 	if account != nil && isGrokTeamModelRateLimited(account, upstreamModel, now) {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	if account != nil && isGrokModelQuotaBlocked(account.ID, upstreamModel, now) {
 		clearBinding()
-		return nil, openAIStickyEscapeNone, nil
+		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape && !req.DisableStickyEscape {
@@ -590,11 +631,11 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 			"error_rate", errorRate,
 			"ttft", ttft,
 		)
-		return nil, openAIStickyEscapeHealth, nil
+		return nil, openAIStickyEscapeHealth, accountID, nil
 	}
 	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
 	if acquireErr != nil && req.DisableStickyEscape {
-		return nil, openAIStickyEscapeNone, acquireErr
+		return nil, openAIStickyEscapeNone, 0, acquireErr
 	}
 	if acquireErr == nil && result != nil && result.Acquired {
 		if !req.PreserveStickyBinding {
@@ -604,7 +645,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 			Account:     account,
 			Acquired:    true,
 			ReleaseFunc: result.ReleaseFunc,
-		}), openAIStickyEscapeNone, nil
+		}), openAIStickyEscapeNone, 0, nil
 	}
 
 	cfg := s.service.schedulingConfig()
@@ -618,7 +659,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 				"error_rate", errorRate,
 				"ttft", ttft,
 			)
-			return nil, openAIStickyEscapeBusy, nil
+			return nil, openAIStickyEscapeBusy, accountID, nil
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 			Account: account,
@@ -628,9 +669,9 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 				Timeout:        cfg.StickySessionWaitTimeout,
 				MaxWaiting:     cfg.StickySessionMaxWaiting,
 			},
-		}), openAIStickyEscapeNone, nil
+		}), openAIStickyEscapeNone, 0, nil
 	}
-	return nil, openAIStickyEscapeNone, nil
+	return nil, openAIStickyEscapeNone, 0, nil
 }
 
 func openAIStickyAccountMatchesGroup(account *Account, groupID *int64) bool {
@@ -814,6 +855,11 @@ func deriveOpenAISelectionSeed(req OpenAIAccountScheduleRequest) uint64 {
 	seed := hasher.Sum64()
 	// 对“无会话锚点”的纯负载均衡请求引入时间熵，避免固定命中同一账号。
 	if strings.TrimSpace(req.SessionHash) == "" && strings.TrimSpace(req.PreviousResponseID) == "" {
+		seed ^= uint64(time.Now().UnixNano())
+	}
+	// NYCATAI patch (sticky-escape-exclude): 健康逃逸后的重选同样引入时间熵,
+	// 避免同一会话每次逃逸都确定性地抽中同一个号。
+	if req.StickyEscapedAccountID > 0 {
 		seed ^= uint64(time.Now().UnixNano())
 	}
 	if seed == 0 {

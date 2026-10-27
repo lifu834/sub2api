@@ -2671,6 +2671,153 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyBusyEscape
 	}
 }
 
+// NYCATAI patch (sticky-escape-exclude): 原号负载/优先级都最好、分值最高, 健康逃逸后重选仍不能抽回它。
+func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyHealthEscapeExcludesEscapedAccount(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10105)
+	accounts := []Account{
+		{ID: 21501, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10, Priority: 0, GroupIDs: []int64{groupID}},
+		{ID: 21502, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10, Priority: 10, GroupIDs: []int64{groupID}},
+		{ID: 21503, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10, Priority: 10, GroupIDs: []int64{groupID}},
+	}
+	sessionKey := "openai:session_hash_health_escape_exclude"
+	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{}}
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
+	cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
+	cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
+	svc := &OpenAIGatewayService{
+		accountRepo:      schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:            cache,
+		cfg:              cfg,
+		rateLimitService: newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{
+			loadMap: map[int64]*AccountLoadInfo{
+				21501: {AccountID: 21501, LoadRate: 0, WaitingCount: 0},
+				21502: {AccountID: 21502, LoadRate: 90, WaitingCount: 9},
+				21503: {AccountID: 21503, LoadRate: 90, WaitingCount: 9},
+			},
+		}),
+		openaiAccountStats: newOpenAIAccountRuntimeStats(),
+	}
+	slowTTFT := 60000
+	for i := 0; i < 3; i++ {
+		svc.openaiAccountStats.report(21501, true, &slowTTFT)
+	}
+
+	selected := map[int64]int{}
+	for i := 0; i < 30; i++ {
+		cache.sessionBindings[sessionKey] = 21501
+		selection, decision, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_health_escape_exclude", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+		require.NoError(t, err)
+		require.NotNil(t, selection)
+		require.NotNil(t, selection.Account)
+		require.NotEqual(t, int64(21501), selection.Account.ID)
+		require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+		require.Equal(t, selection.Account.ID, cache.sessionBindings[sessionKey])
+		selected[selection.Account.ID]++
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+	}
+	require.Zero(t, selected[21501])
+
+	// 调用方传入的排除集合不能被改写。
+	cache.sessionBindings[sessionKey] = 21501
+	excluded := map[int64]struct{}{21503: {}}
+	selection, _, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_health_escape_exclude", "gpt-5.1", excluded, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(21502), selection.Account.ID)
+	require.Len(t, excluded, 1)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+// NYCATAI patch (sticky-escape-exclude): 排除原号后没有其他可用号时, 仍允许选原号, 请求不能失败。
+func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyHealthEscapeFallsBackToEscapedAccount(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10106)
+	accounts := []Account{
+		{ID: 21601, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID}},
+		// 不可调度的号不算可用候选。
+		{ID: 21602, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: false, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID}},
+	}
+	sessionKey := "openai:session_hash_health_escape_only_one"
+	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionKey: 21601}}
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
+	cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
+	cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              cache,
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		openaiAccountStats: newOpenAIAccountRuntimeStats(),
+	}
+	// 5 次失败后错误率 EWMA 约 0.67, 超过 0.5 阈值(3 次只有约 0.49, 不会逃逸)。
+	for i := 0; i < 5; i++ {
+		svc.openaiAccountStats.report(21601, false, nil)
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_health_escape_only_one", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(21601), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Equal(t, int64(21601), cache.sessionBindings[sessionKey])
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+// NYCATAI patch (sticky-escape-exclude): 原号健康时正常粘性不受影响。
+func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyHealthyAccountUnaffectedByEscapeExclude(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10107)
+	accounts := []Account{
+		{ID: 21701, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10, Priority: 10, GroupIDs: []int64{groupID}},
+		{ID: 21702, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, Concurrency: 10, Priority: 0, GroupIDs: []int64{groupID}},
+	}
+	sessionKey := "openai:session_hash_healthy_sticky"
+	cache := &schedulerTestGatewayCache{sessionBindings: map[string]int64{sessionKey: 21701}}
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
+	cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
+	cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
+		cache:              cache,
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		openaiAccountStats: newOpenAIAccountRuntimeStats(),
+	}
+	fastTTFT := 3000
+	for i := 0; i < 3; i++ {
+		svc.openaiAccountStats.report(21701, true, &fastTTFT)
+	}
+
+	for i := 0; i < 10; i++ {
+		selection, decision, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_healthy_sticky", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+		require.NoError(t, err)
+		require.NotNil(t, selection)
+		require.NotNil(t, selection.Account)
+		require.Equal(t, int64(21701), selection.Account.ID)
+		require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
+		require.True(t, decision.StickySessionHit)
+		require.Equal(t, int64(21701), cache.sessionBindings[sessionKey])
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+	}
+}
+
 func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeDisabledKeepsLegacyBehavior(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(10104)
@@ -3630,6 +3777,28 @@ func TestDeriveOpenAISelectionSeed_NoAffinityAddsEntropy(t *testing.T) {
 	require.NotZero(t, seed1)
 	require.NotZero(t, seed2)
 	require.NotEqual(t, seed1, seed2)
+}
+
+// NYCATAI patch (sticky-escape-exclude): 有会话锚点时种子固定; 健康逃逸后的重选加时间熵。
+func TestDeriveOpenAISelectionSeed_StickyHealthEscapeAddsEntropy(t *testing.T) {
+	groupID := int64(10108)
+	req := OpenAIAccountScheduleRequest{
+		GroupID:        &groupID,
+		SessionHash:    "seed_sticky_escape",
+		RequestedModel: "gpt-5.1",
+	}
+	stable1 := deriveOpenAISelectionSeed(req)
+	time.Sleep(1 * time.Millisecond)
+	stable2 := deriveOpenAISelectionSeed(req)
+	require.Equal(t, stable1, stable2)
+
+	req.StickyEscapedAccountID = 21801
+	escaped1 := deriveOpenAISelectionSeed(req)
+	time.Sleep(1 * time.Millisecond)
+	escaped2 := deriveOpenAISelectionSeed(req)
+	require.NotZero(t, escaped1)
+	require.NotZero(t, escaped2)
+	require.NotEqual(t, escaped1, escaped2)
 }
 
 func TestBuildOpenAIWeightedSelectionOrder_HandlesInvalidScores(t *testing.T) {
