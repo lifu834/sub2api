@@ -201,6 +201,9 @@ type openAIAccountRuntimeStats struct {
 type openAIAccountRuntimeStat struct {
 	errorRateEWMABits atomic.Uint64
 	ttftEWMABits      atomic.Uint64
+	// NYCATAI patch (sticky-escape-guard): 记最近一次结果 / 首字样本的时间, 供时间衰减用(见 openai_account_scheduler_nycatai.go)。
+	lastReportNanos atomic.Int64
+	lastTTFTNanos   atomic.Int64
 }
 
 func newOpenAIAccountRuntimeStats() *openAIAccountRuntimeStats {
@@ -246,20 +249,36 @@ func (s *openAIAccountRuntimeStats) report(accountID int64, success bool, firstT
 	}
 	const alpha = 0.2
 	stat := s.loadOrCreate(accountID)
+	// NYCATAI patch (sticky-escape-guard): 旧值先按时间衰减再并入新样本; 衰减关闭时系数为 1、与上游一致。
+	now := nycataiNow().UnixNano()
+	errorDecay := nycataiErrorDecayFactor(stat, now)
+	ttftStale := nycataiTTFTStale(stat, now)
 
 	errorSample := 1.0
 	if success {
 		errorSample = 0.0
 	}
-	updateEWMAAtomic(&stat.errorRateEWMABits, errorSample, alpha)
+	if errorDecay == 1 {
+		updateEWMAAtomic(&stat.errorRateEWMABits, errorSample, alpha)
+	} else {
+		for {
+			oldBits := stat.errorRateEWMABits.Load()
+			newValue := alpha*errorSample + (1-alpha)*math.Float64frombits(oldBits)*errorDecay
+			if stat.errorRateEWMABits.CompareAndSwap(oldBits, math.Float64bits(newValue)) {
+				break
+			}
+		}
+	}
+	stat.lastReportNanos.Store(now)
 
 	if firstTokenMs != nil && *firstTokenMs > 0 {
 		ttft := float64(*firstTokenMs)
 		ttftBits := math.Float64bits(ttft)
+		stat.lastTTFTNanos.Store(now)
 		for {
 			oldBits := stat.ttftEWMABits.Load()
 			oldValue := math.Float64frombits(oldBits)
-			if math.IsNaN(oldValue) {
+			if math.IsNaN(oldValue) || ttftStale {
 				if stat.ttftEWMABits.CompareAndSwap(oldBits, ttftBits) {
 					break
 				}
@@ -285,9 +304,11 @@ func (s *openAIAccountRuntimeStats) snapshot(accountID int64) (errorRate float64
 	if stat == nil {
 		return 0, 0, false
 	}
-	errorRate = clamp01(math.Float64frombits(stat.errorRateEWMABits.Load()))
+	// NYCATAI patch (sticky-escape-guard): 读取时按距上次结果 / 首字样本的时长衰减(关闭时不变)。
+	now := nycataiNow().UnixNano()
+	errorRate = clamp01(math.Float64frombits(stat.errorRateEWMABits.Load()) * nycataiErrorDecayFactor(stat, now))
 	ttftValue := math.Float64frombits(stat.ttftEWMABits.Load())
-	if math.IsNaN(ttftValue) {
+	if math.IsNaN(ttftValue) || nycataiTTFTStale(stat, now) {
 		return errorRate, 0, false
 	}
 	return errorRate, ttftValue, true
@@ -390,6 +411,10 @@ func (s *defaultOpenAIAccountScheduler) Select(
 ) (selection *AccountSelectionResult, decision OpenAIAccountScheduleDecision, err error) {
 	if s != nil && s.service != nil && s.service.openAIGroupRequiresPrivacySet(ctx, req.GroupID) {
 		req.RequirePrivacySet = true
+	}
+	// NYCATAI patch (sticky-escape-guard): 刷新 NYCATAI 开关与衰减参数(5 秒缓存)。
+	if s != nil && s.service != nil {
+		s.service.nycataiSchedulerSettings(ctx)
 	}
 	start := time.Now()
 	// 命名返回值保证 defer 写入的耗时同时返回给调用方。
@@ -624,7 +649,9 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 		return nil, openAIStickyEscapeNone, 0, nil
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
-	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape && !req.DisableStickyEscape {
+	// NYCATAI patch (sticky-escape-guard): 组内没有未超线的候选号时(enforce)不逃逸, 会话留在原号。
+	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape && !req.DisableStickyEscape &&
+		s.nycataiStickyEscapeGuardAllows(ctx, req, accountID, reason, errorRate, ttft, escapeCfg) {
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,
 			"reason", reason,
@@ -2162,6 +2189,7 @@ func (s *OpenAIGatewayService) getOpenAIAccountScheduler(ctx context.Context) Op
 func resetOpenAIAdvancedSchedulerSettingCacheForTest() {
 	openAIAdvancedSchedulerSettingCache = atomic.Value{}
 	openAIAdvancedSchedulerSettingSF = singleflight.Group{}
+	resetNycataiSchedulerSettingsCacheForTest() // NYCATAI patch (sticky-escape-guard)
 }
 
 func (s *OpenAIGatewayService) SelectAccountWithScheduler(
