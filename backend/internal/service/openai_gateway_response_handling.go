@@ -264,8 +264,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	pendingSSEEventType := ""
 	eventInProgress := false
 	eventStartsClientOutput := false
-	// NYCATAI: 暂存的推理事件不提交给客户端，但仍算首输出进展（停首输出计时器）。
-	eventStartsFirstOutputProgress := false
 	eventStartsTTFTOutput := false
 	eventShouldFlush := false
 	handlePendingWriteError := func(err error) {
@@ -285,13 +283,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
 	}
 	completeGuardedEvent := func(queueDrained bool) {
-		completedCommitEvent := eventStartsClientOutput
-		completedProgressEvent := eventStartsClientOutput || eventStartsFirstOutputProgress
+		completedProgressEvent := eventStartsClientOutput
 		completedTTFTEvent := eventStartsTTFTOutput
 		shouldFlush := eventShouldFlush || (queueDrained && clientOutputStarted)
 		eventInProgress = false
 		if !clientDisconnected {
-			if completedCommitEvent {
+			if completedProgressEvent {
 				applyAttemptResponseHeaders()
 			}
 			if shouldFlush {
@@ -314,7 +311,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			firstTokenMs = &ms
 		}
 		eventStartsClientOutput = false
-		eventStartsFirstOutputProgress = false
 		eventStartsTTFTOutput = false
 		eventShouldFlush = false
 	}
@@ -684,17 +680,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
 			startsVisibleOutput := openAIStreamDataStartsVisibleOutput(data, eventType)
 			startsTTFTOutput := openAIStreamDataStartsTTFT(data, eventType, forceFlushFailedEvent, ttftMode)
-			// NYCATAI: 正文/工具调用之前的推理事件留在本次尝试的暂存区，不提交；
-			// 之后若上游 response.failed，客户端什么都没收到，可以安全 failover。
-			// 见 openai_reasoning_prelude_hold.go。
-			holdReasoningPrelude := stageFirstOutput && startsClientOutput && !forceFlushFailedEvent &&
-				!openAIStreamClientOutputStarted(c, clientOutputStarted) &&
-				pendingBytes() < openAIReasoningPreludeHoldMaxBytes &&
-				openAIStreamEventIsReasoningPrelude(data, eventType)
-			commitsClientOutput := startsClientOutput && !holdReasoningPrelude
 			if stageFirstOutput {
-				eventStartsClientOutput = eventStartsClientOutput || commitsClientOutput
-				eventStartsFirstOutputProgress = eventStartsFirstOutputProgress || startsClientOutput
+				eventStartsClientOutput = eventStartsClientOutput || startsClientOutput
 				eventStartsTTFTOutput = eventStartsTTFTOutput || startsTTFTOutput
 				if startsClientOutput {
 					firstOutputScanGuard.Store(false)
@@ -722,8 +709,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 
 			// 写入客户端（客户端断开后继续 drain 上游）
 			if !clientDisconnected && !failureDelivered && !suppressCurrentEvent {
-				shouldFlush := queueDrained && (clientOutputStarted || commitsClientOutput)
-				if firstTokenMs == nil && startsVisibleOutput && !holdReasoningPrelude {
+				shouldFlush := queueDrained && (clientOutputStarted || startsClientOutput)
+				if firstTokenMs == nil && startsVisibleOutput {
 					// 保证首个 token 事件尽快出站，避免影响 TTFT。
 					shouldFlush = true
 				}
@@ -755,7 +742,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				terminalFailurePending = false
 				eventInProgress = false
 				eventStartsClientOutput = false
-				eventStartsFirstOutputProgress = false
 				eventStartsTTFTOutput = false
 				eventShouldFlush = false
 				return
@@ -764,7 +750,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				terminalFailurePending = false
 				eventInProgress = false
 				eventStartsClientOutput = false
-				eventStartsFirstOutputProgress = false
 				eventStartsTTFTOutput = false
 				eventShouldFlush = false
 				return
