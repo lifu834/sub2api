@@ -453,7 +453,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	}
 
 	if !req.StickyWeighted {
-		selection, escapedSticky, err := s.selectBySessionHash(ctx, req)
+		selection, escapeKind, err := s.selectBySessionHashWithEscape(ctx, req)
 		if err != nil {
 			return nil, decision, err
 		}
@@ -464,7 +464,11 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			decision.SelectedAccountType = selection.Account.Type
 			return selection, decision, nil
 		}
-		if escapedSticky {
+		// NYCATAI patch (sticky-escape-rebind): 只有并发满这种瞬时逃逸才保留原绑定。
+		// TTFT/错误率逃逸时原号的 EWMA 只靠真实请求更新, 会话逃走后原号拿不到样本、
+		// 指标冻在超线值, 保留绑定会让该会话每次请求都重新抽号、缓存反复失效。
+		// 因此健康逃逸改为让负载均衡选出的新号接管绑定。
+		if escapeKind == openAIStickyEscapeBusy {
 			req.PreserveStickyBinding = true
 		}
 	}
@@ -492,13 +496,30 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	return selection, decision, nil
 }
 
+// NYCATAI patch (sticky-escape-rebind): 区分逃逸原因。
+type openAIStickyEscapeKind int
+
+const (
+	openAIStickyEscapeNone openAIStickyEscapeKind = iota
+	openAIStickyEscapeHealth
+	openAIStickyEscapeBusy
+)
+
 func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, bool, error) {
+	selection, kind, err := s.selectBySessionHashWithEscape(ctx, req)
+	return selection, kind != openAIStickyEscapeNone, err
+}
+
+func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
+	ctx context.Context,
+	req OpenAIAccountScheduleRequest,
+) (*AccountSelectionResult, openAIStickyEscapeKind, error) {
 	sessionHash := strings.TrimSpace(req.SessionHash)
 	if sessionHash == "" || s == nil || s.service == nil || s.service.cache == nil {
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 
 	accountID := req.StickyAccountID
@@ -511,55 +532,55 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		var err error
 		accountID, err = s.service.getStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		if err != nil || accountID <= 0 {
-			return nil, false, nil
+			return nil, openAIStickyEscapeNone, nil
 		}
 	}
 	if accountID <= 0 {
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	if req.ExcludedIDs != nil {
 		if _, excluded := req.ExcludedIDs[accountID]; excluded {
-			return nil, false, nil
+			return nil, openAIStickyEscapeNone, nil
 		}
 	}
 
 	account, err := s.service.getSchedulableAccount(ctx, accountID)
 	if err != nil || account == nil {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	if !s.isAccountRequestCompatible(ctx, account, req) {
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 	if account == nil || !s.service.openAIAccountMatchesSchedulingGroup(account, req.GroupID) || !s.isAccountRequestCompatible(ctx, account, req) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	// Free-tier soft gate: sticky session must not pin an over-quota free OAuth account.
 	// Admin QueryQuota / import probes do not use this path.
 	if account != nil && len(s.filterGrokFreeQuotaAccounts(ctx, []Account{*account})) == 0 {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	// Team+model cool: sticky must not pin a sibling under the same team 429 window.
 	now := time.Now()
 	upstreamModel := canonicalOpenAIAccountSchedulingModel(account, req.RequestedModel)
 	if account != nil && isGrokTeamModelRateLimited(account, upstreamModel, now) {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	if account != nil && isGrokModelQuotaBlocked(account.ID, upstreamModel, now) {
 		clearBinding()
-		return nil, false, nil
+		return nil, openAIStickyEscapeNone, nil
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape && !req.DisableStickyEscape {
@@ -569,11 +590,11 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 			"error_rate", errorRate,
 			"ttft", ttft,
 		)
-		return nil, true, nil
+		return nil, openAIStickyEscapeHealth, nil
 	}
 	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
 	if acquireErr != nil && req.DisableStickyEscape {
-		return nil, false, acquireErr
+		return nil, openAIStickyEscapeNone, acquireErr
 	}
 	if acquireErr == nil && result != nil && result.Acquired {
 		if !req.PreserveStickyBinding {
@@ -583,7 +604,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 			Account:     account,
 			Acquired:    true,
 			ReleaseFunc: result.ReleaseFunc,
-		}), false, nil
+		}), openAIStickyEscapeNone, nil
 	}
 
 	cfg := s.service.schedulingConfig()
@@ -597,7 +618,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 				"error_rate", errorRate,
 				"ttft", ttft,
 			)
-			return nil, true, nil
+			return nil, openAIStickyEscapeBusy, nil
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 			Account: account,
@@ -607,9 +628,9 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 				Timeout:        cfg.StickySessionWaitTimeout,
 				MaxWaiting:     cfg.StickySessionMaxWaiting,
 			},
-		}), false, nil
+		}), openAIStickyEscapeNone, nil
 	}
-	return nil, false, nil
+	return nil, openAIStickyEscapeNone, nil
 }
 
 func openAIStickyAccountMatchesGroup(account *Account, groupID *int64) bool {

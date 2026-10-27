@@ -2555,7 +2555,21 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByTT
 	require.Equal(t, int64(21102), selection.Account.ID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 	require.False(t, decision.StickySessionHit)
-	require.Equal(t, int64(21101), cache.sessionBindings["openai:session_hash_sticky_ttft"])
+	// NYCATAI patch (sticky-escape-rebind): 健康逃逸后由新号接管绑定
+	require.Equal(t, int64(21102), cache.sessionBindings["openai:session_hash_sticky_ttft"])
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+
+	// NYCATAI patch (sticky-escape-rebind): 原号 EWMA 仍冻在超线值, 下一次请求应直接粘在新号上,
+	// 而不是再逃逸、重新抽号。
+	selection, decision, err = svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_sticky_ttft", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(21102), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerSessionSticky, decision.Layer)
+	require.True(t, decision.StickySessionHit)
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
@@ -2605,7 +2619,8 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyEscapeByEr
 	require.Equal(t, int64(21202), selection.Account.ID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 	require.False(t, decision.StickySessionHit)
-	require.Equal(t, int64(21201), cache.sessionBindings["openai:session_hash_sticky_error_rate"])
+	// NYCATAI patch (sticky-escape-rebind): 健康逃逸后由新号接管绑定
+	require.Equal(t, int64(21202), cache.sessionBindings["openai:session_hash_sticky_error_rate"])
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
@@ -2649,6 +2664,8 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyBusyEscape
 	require.Nil(t, selection.WaitPlan)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
 	require.False(t, decision.StickySessionHit)
+	// NYCATAI patch (sticky-escape-rebind): 并发满属瞬时逃逸, 保留原绑定
+	require.Equal(t, int64(21301), cache.sessionBindings["openai:session_hash_sticky_busy_escape"])
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
