@@ -17,6 +17,8 @@ func normalizeCodexUntrustedContext(body []byte) ([]byte, bool) {
 	if !mayContainCodexCallOutputCandidate(body,
 		"codex_apps_open_page", "codex_apps_selected_page_part_",
 		"browser_info", "goal_objective", "untrusted_context", "untrusted_content", "ide_context", "proposed_plan",
+		// NYCATAI 补丁 261121：官方 0.2.24 尚未覆盖（terminal_info 见 #8991/#8994，browser_tabs 见 #8999）。
+		"terminal_info", "browser_tabs",
 	) || !hasUniqueJSONMembers(body) {
 		return body, false
 	}
@@ -90,6 +92,9 @@ func normalizeCodexUntrustedContext(body []byte) ([]byte, bool) {
 func validCodexUntrustedContext(name, output string) bool {
 	switch name {
 	case "browser_info", "goal_objective", "untrusted_context", "ide_context":
+		return strings.TrimSpace(output) != ""
+	case "terminal_info", "browser_tabs":
+		// NYCATAI 补丁 261121：与 browser_info 同样按非空纯文本处理。
 		return strings.TrimSpace(output) != ""
 	case "untrusted_content":
 		// Codex's fallback for an unnamed context source can carry any text, including an empty value.
