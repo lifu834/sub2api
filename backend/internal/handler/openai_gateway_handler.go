@@ -480,6 +480,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	} else if changed {
 		body = cappedBody
 	}
+	if normalizedBody, changed := normalizeCodexUntrustedContext(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.codex_untrusted_context_normalized",
+			zap.String("normalization", "call_output_to_user_message"),
+		)
+	}
 	if normalizedBody, changed := normalizeCodexAutomationBootstrap(body); changed {
 		body = normalizedBody
 		reqLog.Info("openai.codex_automation_bootstrap_normalized",
@@ -1685,6 +1691,25 @@ func normalizeCodexDelegationBootstrap(body []byte) ([]byte, bool) {
 
 func normalizeCodexAutomationBootstrap(body []byte) ([]byte, bool) {
 	return normalizeCodexCallOutputBootstrap(body, isCodexAutomationCandidate, false)
+}
+
+func mayContainCodexCallOutputCandidate(body []byte, toolNames ...string) bool {
+	if !service.JSONMayEscapePlainASCII(body) && !containsCodexCallOutputLiterals(body, toolNames) {
+		return false
+	}
+	return service.ResponsesInputHasFunctionCallOutputNamed(body, toolNames...)
+}
+
+func containsCodexCallOutputLiterals(body []byte, toolNames []string) bool {
+	if !bytes.Contains(body, []byte("function_call_output")) {
+		return false
+	}
+	for _, name := range toolNames {
+		if bytes.Contains(body, []byte(name)) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeCodexCallOutputBootstrap(body []byte, isCandidate func(map[string]any) bool, allowHistoricalContext bool) ([]byte, bool) {
