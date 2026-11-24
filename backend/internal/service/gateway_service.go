@@ -736,6 +736,10 @@ func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e.Reason == GatewayFailureReasonNycataiEncryptedMismatch {
 		return false
 	}
+	// NYCATAI patch (conversation-reject-failover): 号拒绝这个对话(对话锁 / 通用 400)同样不是号坏了。
+	if e.Reason == GatewayFailureReasonNycataiConversationReject {
+		return false
+	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount
 }
 

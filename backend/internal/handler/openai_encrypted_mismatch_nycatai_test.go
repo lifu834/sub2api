@@ -46,6 +46,27 @@ func TestNycataiEncryptedMismatchExhausted_ReturnsJSON400(t *testing.T) {
 	require.Equal(t, nycataiMismatchClientMessage, errBody["message"])
 }
 
+// NYCATAI patch (conversation-reject-failover): 全组都拒绝这个对话时按 400 回上游原文(如对话锁)。
+func TestNycataiConversationRejectExhausted_ReturnsJSON400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+	failoverErr := nycataiMismatchFailoverTestError()
+	failoverErr.Reason = service.GatewayFailureReasonNycataiConversationReject
+	failoverErr.ClientMessage = "当前对话因上游安全拒绝已锁定"
+
+	(&OpenAIGatewayHandler{}).handleFailoverExhausted(c, failoverErr, false)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	var envelope map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
+	errBody, ok := envelope["error"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "invalid_request_error", errBody["type"])
+	require.Equal(t, "当前对话因上游安全拒绝已锁定", errBody["message"])
+}
+
 func TestNycataiEncryptedMismatchExhausted_ReturnsResponsesSSE(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()

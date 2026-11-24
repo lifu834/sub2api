@@ -1165,6 +1165,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				)
 				continue
 			}
+			// NYCATAI patch (conversation-reject-failover): 该号拒绝这个对话(站方对话锁 / mdkj 通用 400), 换号且不动号的状态。
+			if rejectErr := s.nycataiConversationRejectFailover(c, account, resp.StatusCode, resp.Header, upstreamCode, upstreamMsg, respBody); rejectErr != nil {
+				return nil, rejectErr
+			}
 			if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody) {
 				upstreamDetail := ""
 				if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {

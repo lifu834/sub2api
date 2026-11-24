@@ -424,6 +424,10 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				continue
 			}
 
+			// NYCATAI patch (conversation-reject-failover): 该号拒绝这个对话(站方对话锁 / mdkj 通用 400), 换号且不动号的状态。
+			if rejectErr := s.nycataiConversationRejectFailover(c, account, resp.StatusCode, resp.Header, extractUpstreamErrorCode(probeBody), upstreamMsg, probeBody); rejectErr != nil {
+				return nil, rejectErr
+			}
 			// 透传模式默认保持原样代理；容量错误以及 API-key 上游的瞬时
 			// 5xx 应先触发多账号 failover，且此时尚未写入下游响应。
 			// probeBody 已在上方任务探测时读取过一次，直接复用避免重复读取。

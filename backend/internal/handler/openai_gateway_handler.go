@@ -650,6 +650,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	firstOutputTimeoutSwitchCount := 0
 	// NYCATAI patch (encrypted-mismatch-failover): 本请求因加密上下文不匹配换号的次数。
 	encryptedMismatchSwitches := 0
+	conversationScopedSwitches := 0 // NYCATAI patch (conversation-reject-failover): 加密不匹配 + 对话拒绝的换号总数
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
@@ -900,8 +901,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						return
 					}
 					if !openAIForwardMayFailover(c, writerSizeBeforeForward, failoverErr) {
-						// NYCATAI patch (encrypted-mismatch-failover): 加密不匹配不算号的健康失败。
-						if !failoverErr.IsNycataiEncryptedMismatch() {
+						// NYCATAI patch (encrypted-mismatch / conversation-reject failover): 按对话的换号不算号的健康失败。
+						if !failoverErr.IsNycataiConversationScoped() {
 							h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
 						}
 						h.handleFailoverExhausted(c, failoverErr, true)
@@ -923,16 +924,28 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
-					if failoverErr.IsNycataiEncryptedMismatch() {
-						if service.NycataiEncryptedMismatchSwitchesExhausted(encryptedMismatchSwitches) {
+					if failoverErr.IsNycataiConversationScoped() {
+						// NYCATAI patch (conversation-reject-failover): 加密不匹配与对话拒绝共用单请求换号上限; 换走的号记入会话避号。
+						if service.NycataiEncryptedMismatchSwitchesExhausted(conversationScopedSwitches) {
 							h.handleFailoverExhausted(c, failoverErr, streamStarted)
 							return
 						}
-						encryptedMismatchSwitches++
-						reqLog.Info("nycatai.encrypted_mismatch_failover",
-							zap.Int64("account_id", account.ID),
-							zap.Int("mismatch_switches", encryptedMismatchSwitches),
-						)
+						conversationScopedSwitches++
+						h.gatewayService.NycataiAvoidAccountForConversation(apiKey.GroupID, sessionHash, account.ID)
+						if failoverErr.IsNycataiEncryptedMismatch() {
+							encryptedMismatchSwitches++
+							reqLog.Info("nycatai.encrypted_mismatch_failover",
+								zap.Int64("account_id", account.ID),
+								zap.Int("mismatch_switches", encryptedMismatchSwitches),
+							)
+						} else {
+							reqLog.Info("nycatai.conversation_reject_failover",
+								zap.Int64("account_id", account.ID),
+								zap.Int("upstream_status", failoverErr.StatusCode),
+								zap.String("upstream_message", failoverErr.ClientMessage),
+								zap.Int("conversation_switches", conversationScopedSwitches),
+							)
+						}
 					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
@@ -1022,6 +1035,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			reqLog.Info("nycatai.encrypted_mismatch_recovered",
 				zap.Int64("account_id", account.ID),
 				zap.Int("mismatch_switches", encryptedMismatchSwitches),
+			)
+		}
+		// NYCATAI patch (conversation-reject-failover): 对话被某号拒绝后在这个号上接住了(不钉号, 靠粘性 + 会话避号)。
+		if conversationScopedSwitches > encryptedMismatchSwitches && openAIForwardSucceededForScheduling(result) {
+			reqLog.Info("nycatai.conversation_reject_recovered",
+				zap.Int64("account_id", account.ID),
+				zap.Int("conversation_switches", conversationScopedSwitches),
 			)
 		}
 
@@ -3597,8 +3617,8 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 		)
 		return
 	}
-	// NYCATAI patch (encrypted-mismatch-failover): 全组都解不开时按 400 返回上游原文(请客户端重建上下文)。
-	if failoverErr.IsNycataiEncryptedMismatch() {
+	// NYCATAI patch (encrypted-mismatch / conversation-reject failover): 全组都接不了这个对话时按 400 返回上游原文。
+	if failoverErr.IsNycataiConversationScoped() {
 		message := strings.TrimSpace(failoverErr.ClientMessage)
 		if message == "" {
 			message = "The encrypted conversation context could not be validated. Rebuild the conversation context in the client."
