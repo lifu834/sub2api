@@ -1570,6 +1570,10 @@ func openAIStreamFailedEventShouldFailover(payload []byte, message string) bool 
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
+	// NYCATAI patch (encrypted-mismatch-failover): 加密上下文解不开 = 选错了号, 换号找回原号。
+	if nycataiEncryptedMismatchShouldFailover(payload, message) {
+		return true
+	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1621,6 +1625,10 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	}
 	if isOpenAIContextWindowError(message, payload) {
 		return false
+	}
+	// NYCATAI patch (encrypted-mismatch-failover)
+	if nycataiEncryptedMismatchShouldFailover(payload, message) {
+		return true
 	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
@@ -1801,6 +1809,10 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 	// Preserve the existing generic envelope for unclassified stream failures;
 	// only typed access/capacity failures need the original payload downstream.
 	failoverErr.ResponseBody = body
+	// NYCATAI patch (encrypted-mismatch-failover): 标记后不计号的失败、不同号重试, 耗尽时按 400 回原文。
+	if nycataiEncryptedMismatchShouldFailover(payload, message) {
+		markNycataiEncryptedMismatchFailover(failoverErr, message)
+	}
 	return failoverErr
 }
 

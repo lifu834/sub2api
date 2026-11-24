@@ -598,7 +598,12 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 		var err error
 		accountID, err = s.service.getStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		if err != nil || accountID <= 0 {
-			return nil, openAIStickyEscapeNone, 0, nil
+			// NYCATAI patch (encrypted-mismatch-failover): 粘性已过期但会话钉过号(加密内容只有它解得开), 优先回原号;
+			// 后续可用性 / 兼容性检查照常, 不合格就按常规选号。
+			accountID = nycataiEncryptedLineagePinnedAccount(req.GroupID, sessionHash)
+			if accountID <= 0 {
+				return nil, openAIStickyEscapeNone, 0, nil
+			}
 		}
 	}
 	if accountID <= 0 {
@@ -651,6 +656,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHashWithEscape(
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	// NYCATAI patch (sticky-escape-guard): 组内没有未超线的候选号时(enforce)不逃逸, 会话留在原号。
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape && !req.DisableStickyEscape &&
+		!nycataiStickyEscapeBlockedByLineagePin(req.GroupID, sessionHash, accountID, reason, errorRate, ttft) &&
 		s.nycataiStickyEscapeGuardAllows(ctx, req, accountID, reason, errorRate, ttft, escapeCfg) {
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,

@@ -648,6 +648,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	firstOutputTimeoutSwitchCount := 0
+	// NYCATAI patch (encrypted-mismatch-failover): 本请求因加密上下文不匹配换号的次数。
+	encryptedMismatchSwitches := 0
 	profitVetoCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
@@ -898,7 +900,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						return
 					}
 					if !openAIForwardMayFailover(c, writerSizeBeforeForward, failoverErr) {
-						h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
+						// NYCATAI patch (encrypted-mismatch-failover): 加密不匹配不算号的健康失败。
+						if !failoverErr.IsNycataiEncryptedMismatch() {
+							h.gatewayService.ObserveOpenAIAccountHealthFailure(c.Request.Context(), account, err)
+						}
 						h.handleFailoverExhausted(c, failoverErr, true)
 						return
 					}
@@ -917,6 +922,17 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					if openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
+					}
+					if failoverErr.IsNycataiEncryptedMismatch() {
+						if service.NycataiEncryptedMismatchSwitchesExhausted(encryptedMismatchSwitches) {
+							h.handleFailoverExhausted(c, failoverErr, streamStarted)
+							return
+						}
+						encryptedMismatchSwitches++
+						reqLog.Info("nycatai.encrypted_mismatch_failover",
+							zap.Int64("account_id", account.ID),
+							zap.Int("mismatch_switches", encryptedMismatchSwitches),
+						)
 					}
 					// 池模式：同账号重试
 					if failoverErr.RetryableOnSameAccount {
@@ -999,6 +1015,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, result), openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
 		} else {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, result), openAIForwardSucceededForScheduling(result), nil)
+		}
+		// NYCATAI patch (encrypted-mismatch-failover): 换号后在这个号上解开了, 把会话钉在它上面。
+		if encryptedMismatchSwitches > 0 && openAIForwardSucceededForScheduling(result) {
+			h.gatewayService.NycataiPinEncryptedLineage(apiKey.GroupID, sessionHash, account.ID)
+			reqLog.Info("nycatai.encrypted_mismatch_recovered",
+				zap.Int64("account_id", account.ID),
+				zap.Int("mismatch_switches", encryptedMismatchSwitches),
+			)
 		}
 
 		// 使用量记录通过有界 worker 池提交，避免请求热路径创建无界 goroutine。
@@ -3571,6 +3595,16 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 			service.OpenAIRequestBodyTooLargeClientMessage,
 			streamStarted,
 		)
+		return
+	}
+	// NYCATAI patch (encrypted-mismatch-failover): 全组都解不开时按 400 返回上游原文(请客户端重建上下文)。
+	if failoverErr.IsNycataiEncryptedMismatch() {
+		message := strings.TrimSpace(failoverErr.ClientMessage)
+		if message == "" {
+			message = "The encrypted conversation context could not be validated. Rebuild the conversation context in the client."
+		}
+		service.SetOpsUpstreamError(c, failoverErr.StatusCode, message, "")
+		h.handleStreamingAwareError(c, http.StatusBadRequest, "invalid_request_error", message, streamStarted)
 		return
 	}
 	if failoverErr.Reason == service.OpenAIHTTPContinuationUnsupportedReason {

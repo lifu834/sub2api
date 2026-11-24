@@ -732,6 +732,10 @@ func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e == nil {
 		return false
 	}
+	// NYCATAI patch (encrypted-mismatch-failover): 加密上下文不匹配是选错号, 不是号坏了。
+	if e.Reason == GatewayFailureReasonNycataiEncryptedMismatch {
+		return false
+	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount
 }
 

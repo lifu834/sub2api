@@ -59,6 +59,7 @@ func resetNycataiSchedulerSettingsCacheForTest() {
 	nycataiSchedulerSettingsSF = singleflight.Group{}
 	nycataiErrorHalfLifeNanos.Store(0)
 	nycataiTTFTStaleNanos.Store(0)
+	nycataiEncryptedMismatchFailoverOn.Store(false)
 }
 
 func parseNycataiEscapeGuard(raw string) string {
@@ -91,7 +92,7 @@ func (s *OpenAIGatewayService) nycataiSchedulerSettings(ctx context.Context) nyc
 		if repo := s.openAIAdvancedSchedulerSettingRepo(); repo != nil {
 			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAdvancedSchedulerSettingDBTimeout)
 			defer cancel()
-			keys := []string{SettingKeyNycataiStickyEscapeGuard, SettingKeyNycataiRuntimeStatsErrorHalfLifeS, SettingKeyNycataiRuntimeStatsTTFTStaleS}
+			keys := []string{SettingKeyNycataiStickyEscapeGuard, SettingKeyNycataiRuntimeStatsErrorHalfLifeS, SettingKeyNycataiRuntimeStatsTTFTStaleS, SettingKeyNycataiEncryptedMismatchFailover}
 			if got, err := repo.GetMultiple(dbCtx, keys); err == nil {
 				values = got
 			} else {
@@ -101,6 +102,7 @@ func (s *OpenAIGatewayService) nycataiSchedulerSettings(ctx context.Context) nyc
 		settings := nycataiSchedulerSettings{escapeGuard: parseNycataiEscapeGuard(values[SettingKeyNycataiStickyEscapeGuard])}
 		nycataiErrorHalfLifeNanos.Store(int64(parseNycataiSeconds(values[SettingKeyNycataiRuntimeStatsErrorHalfLifeS])))
 		nycataiTTFTStaleNanos.Store(int64(parseNycataiSeconds(values[SettingKeyNycataiRuntimeStatsTTFTStaleS])))
+		nycataiEncryptedMismatchFailoverOn.Store(parseNycataiOnOff(values[SettingKeyNycataiEncryptedMismatchFailover]))
 		nycataiSchedulerSettingsCache.Store(&cachedNycataiSchedulerSettings{
 			nycataiSchedulerSettings: settings,
 			expiresAt:                time.Now().Add(nycataiSchedulerSettingsCacheTTL).UnixNano(),
